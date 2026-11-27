@@ -16,6 +16,8 @@
 //   READ_ONLY                 "true" hides create_task, mark_done, reschedule_task.
 //   EXCLUDED_CATEGORIES       comma list of category titles get_active_tasks skips
 //                             (with their descendants). Default "Lists,Inbox".
+//   MARVIN_MIN_GAP_MS         milliseconds between Marvin queries. Default 3000,
+//                             Marvin's documented limit. Tests set it lower.
 //
 // Endpoint: POST https://<worker>.workers.dev/mcp/<CONNECTOR_SECRET>
 // (or POST /mcp with "Authorization: Bearer <CONNECTOR_SECRET>").
@@ -24,13 +26,25 @@ const SERVER_INFO = { name: "amazing-marvin", version: "1.0.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MARVIN_BASE = "https://serv.amazingmarvin.com/api";
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-// Workers' free plan allows 50 outbound requests per invocation; leave headroom.
-const MAX_CATEGORY_FETCHES = 40;
+// Marvin asks API clients not to burst more than one query every 3 seconds,
+// nor 1440 queries a day: https://github.com/amazingmarvin/MarvinAPI/wiki
+const DEFAULT_MIN_GAP_MS = 3000;
+const MAX_RETRIES = 2; // on 429. Worst case stays under Workers' 50-subrequest cap.
+const NAMES_TTL_MS = 10 * 60 * 1000; // how long category and label names are reused
+// get_active_tasks needs one query per category; 10 keeps a call near 30 seconds.
+const ACTIVE_TASKS_READS_PER_CALL = 10;
+
+// Module scope lives as long as the isolate, across requests. Workers forbid
+// sharing promises or I/O between requests, so only plain values go here.
+const shared = { lastCallAt: 0, names: new Map() };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const INSTRUCTIONS =
   "Tools for the user's Amazing Marvin task manager. 'Today' means tasks scheduled " +
   "for a day (get_today_items). The Inbox is unscheduled, unfiled items (get_inbox). " +
-  "Dates are YYYY-MM-DD in the user's time zone. Item ids come from the read tools.";
+  "Dates are YYYY-MM-DD in the user's time zone. Item ids come from the read tools. " +
+  "Marvin allows one API query every 3 seconds, so prefer the specific tools; " +
+  "get_active_tasks is slow and reads 10 categories per call.";
 
 // ---------------------------------------------------------------- HTTP entry
 
@@ -151,6 +165,9 @@ class Marvin {
   constructor(env) {
     this.env = env;
     this.cache = new Map(); // per-request cache of GETs
+    this.queue = Promise.resolve(); // one Marvin query at a time
+    const gap = Number(env.MARVIN_MIN_GAP_MS);
+    this.gap = env.MARVIN_MIN_GAP_MS !== undefined && Number.isFinite(gap) && gap >= 0 ? gap : DEFAULT_MIN_GAP_MS;
   }
 
   headers(fullAccess) {
@@ -170,33 +187,60 @@ class Marvin {
     return h;
   }
 
-  async call(method, endpoint, { params, body, fullAccess = false } = {}) {
+  call(method, endpoint, { params, body, fullAccess = false, headers } = {}) {
     const url = new URL(`${MARVIN_BASE}/${endpoint}`);
     if (params) for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     const key = method === "GET" ? url.toString() : null;
     if (key && this.cache.has(key)) return this.cache.get(key);
 
-    const res = await fetch(url.toString(), {
-      method,
-      headers: this.headers(fullAccess),
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const raw = await res.text();
-    if (!res.ok) {
-      const hint = res.status === 401 || res.status === 403 ? " (check the Marvin token)" : "";
-      throw new Error(`Marvin API returned ${res.status} for ${endpoint}${hint}: ${raw.slice(0, 200)}`);
+    const run = this.queue.then(() =>
+      this.send(method, url.toString(), endpoint, { body, headers: { ...this.headers(fullAccess), ...headers } }));
+    this.queue = run.catch(() => {});
+    if (key) this.cache.set(key, run);
+    return run;
+  }
+
+  async send(method, url, endpoint, { body, headers }) {
+    for (let attempt = 0; ; attempt++) {
+      const wait = shared.lastCallAt + this.gap - Date.now();
+      if (wait > 0) await sleep(wait);
+      shared.lastCallAt = Date.now();
+      const res = await fetch(url, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const raw = await res.text();
+      shared.lastCallAt = Date.now();
+      if (res.status === 429 && attempt < MAX_RETRIES) {
+        const after = Number(res.headers.get("Retry-After"));
+        await sleep(after > 0 ? Math.min(after * 1000, 15000) : this.gap * (attempt + 1));
+        continue;
+      }
+      if (!res.ok) {
+        const hint = res.status === 401 || res.status === 403 ? " (check the Marvin token)"
+          : res.status === 429 ? " (Marvin's rate limit; try again in a minute)" : "";
+        throw new Error(`Marvin API returned ${res.status} for ${endpoint}${hint}: ${raw.slice(0, 200)}`);
+      }
+      try { return raw ? JSON.parse(raw) : null; } catch { return raw; /* plain-text reply */ }
     }
-    let data = raw;
-    try { data = raw ? JSON.parse(raw) : null; } catch { /* plain-text reply */ }
-    if (key) this.cache.set(key, data);
+  }
+
+  // Category and label names change rarely, so reuse them across requests.
+  // fresh: true reads them again (for the tools that list them).
+  async names(endpoint, { fresh = false } = {}) {
+    const hit = shared.names.get(endpoint);
+    if (!fresh && hit && Date.now() - hit.at < NAMES_TTL_MS) return hit.data;
+    const data = await this.call("GET", endpoint);
+    shared.names.set(endpoint, { at: Date.now(), data });
     return data;
   }
 
   todayItems(date) { return this.call("GET", "todayItems", { params: { date } }); }
   dueItems(by) { return this.call("GET", "dueItems", { params: { by } }); }
   children(parentId) { return this.call("GET", "children", { params: { parentId } }); }
-  categories() { return this.call("GET", "categories"); }
-  labels() { return this.call("GET", "labels"); }
+  categories(opts) { return this.names("categories", opts); }
+  labels(opts) { return this.names("labels", opts); }
 }
 
 // ---------------------------------------------------------------- dates
@@ -232,8 +276,12 @@ function checkDate(value, name) {
 
 const isScheduled = (item) => Boolean(item.day) && item.day !== "unassigned";
 
-async function lookups(marvin) {
-  const [cats, labels] = await Promise.all([marvin.categories(), marvin.labels()]);
+// Names for the parents and labels these items use. Skips the query when no item needs it.
+async function lookups(marvin, items) {
+  const needCats = items.some((i) => i.parentId && i.parentId !== "unassigned" && i.parentId !== "root");
+  const needLabels = items.some((i) => Array.isArray(i.labelIds) && i.labelIds.length);
+  const cats = needCats ? await marvin.categories() : [];
+  const labels = needLabels ? await marvin.labels() : [];
   return {
     catTitle: new Map((cats || []).map((c) => [c._id, c.title])),
     labelTitle: new Map((labels || []).map((l) => [l._id, l.title])),
@@ -290,8 +338,8 @@ const TOOLS = [
     },
     async handler(args, { env, marvin }) {
       const date = checkDate(args.date, "date") || todayIn(env);
-      const [items, lk] = await Promise.all([marvin.todayItems(date), lookups(marvin)]);
-      const list = arr(items).filter((i) => args.include_done || !i.done);
+      const list = arr(await marvin.todayItems(date)).filter((i) => args.include_done || !i.done);
+      const lk = await lookups(marvin, list);
       return { date, count: list.length, items: list.map((i) => shape(i, lk)) };
     },
   },
@@ -307,8 +355,9 @@ const TOOLS = [
     async handler(args, { env, marvin }) {
       const today = todayIn(env);
       const by = checkDate(args.by, "by") || today;
-      const [items, lk] = await Promise.all([marvin.dueItems(by), lookups(marvin)]);
-      const list = arr(items).filter((i) => !i.done).map((i) => {
+      const open = arr(await marvin.dueItems(by)).filter((i) => !i.done);
+      const lk = await lookups(marvin, open);
+      const list = open.map((i) => {
         const s = shape(i, lk);
         if (i.dueDate && i.dueDate < today) s.overdue = true;
         return s;
@@ -324,23 +373,32 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
     async handler(args, { env, marvin }) {
       const today = todayIn(env);
-      const [items, lk] = await Promise.all([marvin.children("unassigned"), lookups(marvin)]);
-      const list = arr(items).filter((i) =>
+      const list = arr(await marvin.children("unassigned")).filter((i) =>
         !i.done &&
         !i.backburner &&
         !isScheduled(i) &&
         !(i.startDate && i.startDate > today) &&
         !i.recurringTaskId
       );
+      const lk = await lookups(marvin, list);
       return { count: list.length, items: list.map((i) => shape(i, lk)) };
     },
   },
   {
     name: "get_active_tasks",
     title: "Active tasks",
-    description: "Open tasks across all categories and projects, like Marvin's Active Tasks list: skips projects, backburnered items and categories, and the excluded categories (default Lists and Inbox) with their sub-projects. Slow: one request per category.",
+    description: "Open tasks across categories and projects, like Marvin's Active Tasks list: skips projects themselves, backburnered items and categories, and the excluded categories (default Lists and Inbox) with their sub-projects. Slow: Marvin allows one query every 3 seconds, so each call reads at most 10 categories (about 30 seconds) and lists the rest in notReadYet. Pass some of those ids as category_ids to read them next.",
     annotations: READ,
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: {
+      type: "object",
+      properties: {
+        category_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Read only these categories or projects, such as ids from notReadYet.",
+        },
+      },
+    },
     async handler(args, { env, marvin }) {
       const cats = arr(await marvin.categories());
       const byId = new Map(cats.map((c) => [c._id, c]));
@@ -363,31 +421,34 @@ const TOOLS = [
         return Boolean(c.backburner) || backburnered(c.parentId, seen);
       };
 
-      const targets = cats.filter((c) => !excluded.has(c._id) && !backburnered(c._id));
-      const budget = MAX_CATEGORY_FETCHES - 2; // categories + labels already used
-      const toFetch = targets.slice(0, budget);
-      const skipped = targets.slice(budget).map((c) => c.title);
+      let targets = cats.filter((c) => !excluded.has(c._id) && !backburnered(c._id));
+      let ignored = [];
+      if (Array.isArray(args.category_ids) && args.category_ids.length) {
+        const wanted = args.category_ids.map(String);
+        ignored = wanted.filter((id) => !targets.some((c) => c._id === id));
+        targets = targets.filter((c) => wanted.includes(c._id));
+      }
+      const toFetch = targets.slice(0, ACTIVE_TASKS_READS_PER_CALL);
+      const notRead = targets.slice(ACTIVE_TASKS_READS_PER_CALL);
 
-      const lk = await lookups(marvin);
       const seenTask = new Set();
-      const tasks = [];
-      // Two at a time: Marvin asks clients to keep request rates low.
-      for (let i = 0; i < toFetch.length; i += 2) {
-        const batch = await Promise.all(toFetch.slice(i, i + 2).map((c) => marvin.children(c._id)));
-        for (const kids of batch) {
-          for (const t of arr(kids)) {
-            if (t.type === "project" || t.done || t.backburner || excluded.has(t.parentId)) continue;
-            if (seenTask.has(t._id)) continue;
-            seenTask.add(t._id);
-            tasks.push(shape(t, lk));
-          }
+      const found = [];
+      for (const c of toFetch) {
+        for (const t of arr(await marvin.children(c._id))) {
+          if (t.type === "project" || t.done || t.backburner || excluded.has(t.parentId)) continue;
+          if (seenTask.has(t._id)) continue;
+          seenTask.add(t._id);
+          found.push(t);
         }
       }
-      const out = { count: tasks.length, items: tasks };
-      if (skipped.length) {
-        out.warning = `Only the first ${toFetch.length} categories were read (hosting limit); ${skipped.length} skipped.`;
-        out.skippedCategories = skipped;
+      const lk = await lookups(marvin, found);
+      const out = { count: found.length, items: found.map((t) => shape(t, lk)) };
+      if (notRead.length) {
+        out.warning = `Read ${toFetch.length} of ${targets.length} categories (Marvin allows one query every 3 seconds). ` +
+          "Call again with category_ids from notReadYet to read more.";
+        out.notReadYet = notRead.map((c) => ({ id: c._id, title: c.title }));
       }
+      if (ignored.length) out.ignoredIds = ignored; // excluded, backburnered or unknown
       return out;
     },
   },
@@ -403,8 +464,8 @@ const TOOLS = [
     },
     async handler(args, { marvin }) {
       if (!args.parent_id || typeof args.parent_id !== "string") throw new Error("parent_id is required.");
-      const [items, lk] = await Promise.all([marvin.children(args.parent_id), lookups(marvin)]);
-      const list = arr(items).filter((i) => !i.done);
+      const list = arr(await marvin.children(args.parent_id)).filter((i) => !i.done);
+      const lk = await lookups(marvin, list);
       return { parentId: args.parent_id, count: list.length, items: list.map((i) => shape(i, lk)) };
     },
   },
@@ -415,7 +476,7 @@ const TOOLS = [
     annotations: READ,
     inputSchema: { type: "object", properties: {} },
     async handler(args, { marvin }) {
-      const cats = arr(await marvin.categories());
+      const cats = arr(await marvin.categories({ fresh: true }));
       const title = new Map(cats.map((c) => [c._id, c.title]));
       return {
         count: cats.length,
@@ -436,7 +497,7 @@ const TOOLS = [
     annotations: READ,
     inputSchema: { type: "object", properties: {} },
     async handler(args, { marvin }) {
-      const labels = arr(await marvin.labels());
+      const labels = arr(await marvin.labels({ fresh: true }));
       return { count: labels.length, items: labels.map((l) => ({ id: l._id, title: l.title })) };
     },
   },
@@ -474,15 +535,9 @@ const TOOLS = [
       if (Array.isArray(args.label_ids) && args.label_ids.length) body.labelIds = args.label_ids.map(String);
       if (args.starred !== undefined) body.isStarred = Number(args.starred);
 
-      const url = new URL(`${MARVIN_BASE}/addTask`);
-      const headers = marvin.headers(false);
-      if (args.auto_complete === false) headers["X-Auto-Complete"] = "false";
-      const res = await fetch(url.toString(), { method: "POST", headers, body: JSON.stringify(body) });
-      const raw = await res.text();
-      if (!res.ok) throw new Error(`Marvin API returned ${res.status} for addTask: ${raw.slice(0, 200)}`);
-      let created = null;
-      try { created = JSON.parse(raw); } catch { /* ignore */ }
-      return { created: created && created._id ? shape(created) : raw };
+      const headers = args.auto_complete === false ? { "X-Auto-Complete": "false" } : undefined;
+      const created = await marvin.call("POST", "addTask", { body, headers });
+      return { created: created && created._id ? shape(created) : created };
     },
   },
   {
@@ -547,4 +602,7 @@ function visibleTools(env) {
 }
 
 // Exported for tests.
-export const _internal = { todayIn, utcOffsetMinutes, shape, TOOLS };
+export const _internal = {
+  todayIn, utcOffsetMinutes, shape, TOOLS,
+  clearNames() { shared.names.clear(); },
+};
