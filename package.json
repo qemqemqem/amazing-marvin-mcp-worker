@@ -1,0 +1,21 @@
+{
+  "name": "amazing-marvin-mcp-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Remote MCP server for Amazing Marvin, for Cloudflare Workers",
+  "scripts": {
+    "test": "node test/test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "wrangler": "^4.165.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qemqemqem/amazing-marvin-mcp-worker"
+  }
+}
