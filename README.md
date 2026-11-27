@@ -11,7 +11,7 @@ You host your own copy. Your Marvin token stays in your own Cloudflare account's
 | `get_today_items` | Tasks scheduled for a day (default today), including rollovers |
 | `get_due_items` | Open items due on or before a date; flags overdue ones |
 | `get_inbox` | The Inbox as the app shows it: unfiled, unscheduled, not backburnered, no future start date |
-| `get_active_tasks` | Open tasks across all categories, skipping `Lists`, `Inbox` and backburnered ones |
+| `get_active_tasks` | Open tasks across categories, skipping `Lists`, `Inbox` and backburnered ones; 10 categories per call (see Limits) |
 | `get_children` | Items directly inside one category or project |
 | `get_categories`, `get_labels` | Ids and names, for the other tools |
 | `create_task` | New task; the title accepts Marvin shortcuts like `+today` and `#Category` |
@@ -24,7 +24,7 @@ Set `READ_ONLY = "true"` to expose only the seven read tools.
 
 The server answers only at `/mcp/<CONNECTOR_SECRET>`, a random 64-character secret you create. Any other request gets `404 Not found`. The URL is the credential, so treat it like a password. `Authorization: Bearer <CONNECTOR_SECRET>` on `/mcp` also works, for clients that send headers.
 
-The server is stateless and stores nothing. It talks only to `serv.amazingmarvin.com`.
+The server stores nothing except category and label names, kept in memory for up to 10 minutes. It talks only to `serv.amazingmarvin.com`.
 
 ## Deploy
 
@@ -37,11 +37,12 @@ npm install
 npm test
 ```
 
-The 23 tests run the worker against a fake Marvin API and use the official MCP SDK client for the handshake.
+The 27 tests run the worker against a fake Marvin API that enforces Marvin's rate limit, and use the official MCP SDK client for the handshake.
 
 ## Limits
 
-- Cloudflare's free plan allows 50 outbound requests per invocation, so `get_active_tasks` reads at most 38 categories and lists any it skipped.
+- Marvin [asks API clients](https://github.com/amazingmarvin/MarvinAPI/wiki) to send at most one query every 3 seconds and 1,440 a day, and answers bursts with `429 Too many AM API requests`. The server sends one query at a time, 3 seconds apart, and waits and retries on a 429. Most tools need one query; the first call after a while may need one or two more for names.
+- Marvin has no "all tasks" endpoint, so `get_active_tasks` needs one query per category or project. It reads 10 per call (about 30 seconds) and lists the rest in `notReadYet`; Claude passes those ids back as `category_ids` to read more.
 - Marvin's API does not expose Smart Lists.
 - Recurring tasks marked done here may spawn their next copy only when the Marvin app syncs.
 

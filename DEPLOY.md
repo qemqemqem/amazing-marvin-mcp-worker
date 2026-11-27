@@ -49,7 +49,7 @@ First set `TIMEZONE` in `wrangler.toml` to your IANA time zone (it defaults to `
 ```
 cd amazing-marvin-mcp-worker
 npm install
-npm test                      # optional: 23 tests against a fake Marvin
+npm test                      # optional: 27 tests against a fake Marvin
 npx wrangler login            # opens Cloudflare in your browser
 npx wrangler secret put CONNECTOR_SECRET
 npx wrangler secret put MARVIN_API_TOKEN
@@ -93,6 +93,8 @@ You should see your Inbox items as JSON. `Not found` means the secret in the URL
 
 ## Limits worth knowing
 
-- Cloudflare's free plan allows 100,000 requests a day and 50 outbound calls per request. `get_active_tasks` makes one call per category, so it reads at most 38 categories and says which it skipped. The other tools use two or three calls each.
+- Marvin allows one API query every 3 seconds and 1,440 a day. The server spaces its queries 3 seconds apart and retries after a `429`. Most tools need one query.
+- `get_active_tasks` needs one query per category, so it reads 10 categories per call (about 30 seconds) and lists the rest for the next call.
+- Cloudflare's free plan allows 100,000 requests a day, far more than Marvin's limit.
 - Marvin's API doesn't expose Smart Lists, and recurring tasks marked done here may only spawn their next copy when the Marvin app syncs.
-- The server keeps no data and no logs of its own. Cloudflare's dashboard logs may show request URLs, including the secret, to you only.
+- The server keeps no data and no logs of its own, apart from category and label names held in memory for up to 10 minutes. Cloudflare's dashboard logs may show request URLs, including the secret, to you only.

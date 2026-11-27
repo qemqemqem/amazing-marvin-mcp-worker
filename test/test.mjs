@@ -14,6 +14,7 @@ const BASE_ENV = {
   CONNECTOR_SECRET: SECRET,
   MARVIN_API_TOKEN: "limited-token-XYZ",
   TIMEZONE: "America/Los_Angeles",
+  MARVIN_MIN_GAP_MS: "30", // the real gap is 3000 ms; the mock enforces this one
 };
 
 // ------------------------------------------------------------ mock Marvin
@@ -53,11 +54,22 @@ const children = {
 
 let requests = [];
 let failWith = null;
+let rateLimitNext = 0; // answer this many requests with 429 first
+// Marvin allows one query per gap. Count every request that comes sooner.
+let lastMarvinAt = 0;
+let bursts = 0;
 
 function marvinMock(url, init = {}) {
   const u = new URL(url);
   const body = init.body ? JSON.parse(init.body) : undefined;
-  requests.push({ path: u.pathname, params: Object.fromEntries(u.searchParams), headers: init.headers, body, method: init.method });
+  const now = Date.now();
+  if (lastMarvinAt && now - lastMarvinAt < Number(BASE_ENV.MARVIN_MIN_GAP_MS) - 5) bursts++;
+  lastMarvinAt = now;
+  requests.push({ path: u.pathname, params: Object.fromEntries(u.searchParams), headers: init.headers, body, method: init.method, at: now });
+  if (rateLimitNext > 0) {
+    rateLimitNext--;
+    return new Response("Too many AM API requests. Try again soon.", { status: 429 });
+  }
   if (failWith) return new Response("Unauthorized", { status: failWith });
   const ok = (x) => new Response(JSON.stringify(x), { status: 200 });
   switch (u.pathname) {
@@ -268,15 +280,74 @@ await test("READ_ONLY hides the write tools", async () => {
 await test("get_active_tasks caps category reads and says so", async () => {
   const saved = cats.length;
   for (let i = 0; i < 60; i++) cats.push({ _id: `c${i}`, title: `Cat ${i}`, parentId: "root" });
+  _internal.clearNames();
   const env = BASE_ENV;
   const s = await serve(env);
   const c = await connect(`http://127.0.0.1:${s.address().port}`, env);
   requests = [];
   const r = parse(await c.callTool({ name: "get_active_tasks", arguments: {} }));
-  assert.match(r.warning, /skipped/);
-  assert.ok(requests.length <= 45, `made ${requests.length} Marvin requests`);
+  const childReads = () => requests.filter((q) => q.path === "/api/children").length;
+  assert.equal(childReads(), 10);
+  assert.match(r.warning, /category_ids/);
+  assert.equal(r.notReadYet.length, 62 - 10); // 2 eligible + 60 new, minus the 10 read
+  // The next call reads exactly the categories it is given.
+  requests = [];
+  const ids = r.notReadYet.slice(0, 3).map((x) => x.id);
+  const r2 = parse(await c.callTool({ name: "get_active_tasks", arguments: { category_ids: ids } }));
+  assert.deepEqual(requests.filter((q) => q.path === "/api/children").map((q) => q.params.parentId), ids);
+  assert.equal(r2.notReadYet, undefined);
   cats.length = saved;
+  _internal.clearNames();
   await c.close(); s.close();
+});
+
+await test("get_inbox makes one Marvin query when no names are needed", async () => {
+  _internal.clearNames();
+  const s = await serve(BASE_ENV);
+  const c = await connect(`http://127.0.0.1:${s.address().port}`, BASE_ENV);
+  requests = [];
+  await c.callTool({ name: "get_inbox", arguments: {} });
+  assert.deepEqual(requests.map((q) => q.path), ["/api/children"]);
+  await c.close(); s.close();
+});
+
+await test("category and label names are reused between calls", async () => {
+  _internal.clearNames();
+  const s = await serve(BASE_ENV);
+  const c = await connect(`http://127.0.0.1:${s.address().port}`, BASE_ENV);
+  await c.callTool({ name: "get_today_items", arguments: {} }); // loads categories
+  requests = [];
+  const r = parse(await c.callTool({ name: "get_due_items", arguments: {} }));
+  assert.deepEqual(requests.map((q) => q.path), ["/api/dueItems"]);
+  assert.equal(r.items.find((i) => i.id === "d1").parent, "Launch");
+  // Asking for categories directly always reads them fresh.
+  requests = [];
+  await c.callTool({ name: "get_categories", arguments: {} });
+  assert.deepEqual(requests.map((q) => q.path), ["/api/categories"]);
+  await c.close(); s.close();
+});
+
+await test("a 429 from Marvin is retried after a pause", async () => {
+  const s = await serve(BASE_ENV);
+  const c = await connect(`http://127.0.0.1:${s.address().port}`, BASE_ENV);
+  requests = [];
+  rateLimitNext = 1;
+  const r = parse(await c.callTool({ name: "get_labels", arguments: {} }));
+  assert.equal(r.count, 1);
+  const tries = requests.filter((q) => q.path === "/api/labels");
+  assert.equal(tries.length, 2);
+  assert.ok(tries[1].at - tries[0].at >= 30, "waited before retrying");
+  // Repeated 429s end in a clear tool error, not a hang.
+  rateLimitNext = 10;
+  const bad = await c.callTool({ name: "get_labels", arguments: {} });
+  rateLimitNext = 0;
+  assert.equal(bad.isError, true);
+  assert.match(bad.content[0].text, /429.*rate limit/);
+  await c.close(); s.close();
+});
+
+await test("never queries Marvin faster than the minimum gap", async () => {
+  assert.equal(bursts, 0, `${bursts} requests came too soon after the previous one`);
 });
 
 // ------------------------------------------------------------ raw HTTP checks
